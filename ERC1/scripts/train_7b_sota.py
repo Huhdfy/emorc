@@ -75,14 +75,22 @@ class MultiDatasetEmotionDataset(Dataset):
     
     def __len__(self):
         return len(self.samples)
+
+    def _build_prev_impact(self, sample):
+        if sample.prev_emotion:
+            return f"Previous emotion was {sample.prev_emotion}."
+        return None
     
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        prev_impact = self._build_prev_impact(sample)
         prompt = self.builder.build_training_prompt(
             dialogue_history=sample.dialogue_history,
             target_utterance=sample.target_utterance,
             emotion=sample.emotion,
             speaker=sample.speaker,
+            prev_impact=prev_impact,
+            explanation=sample.explanation,
         )
         
         encodings = self.tokenizer(
@@ -101,6 +109,8 @@ class MultiDatasetEmotionDataset(Dataset):
         prompt_without_res = self.builder.build_inference_prompt(
             dialogue_history=sample.dialogue_history,
             target_utterance=sample.target_utterance,
+            prev_impact=prev_impact,
+            force_explanation=bool(sample.explanation),
         )
         # We need to be careful with tokens. Finding string match is safer.
         # But for speed, we use the length of the encoded prompt.
@@ -108,8 +118,15 @@ class MultiDatasetEmotionDataset(Dataset):
         response_start_idx = len(prompt_enc["input_ids"])
         
         labels[:response_start_idx] = -100
-        labels[labels == self.tokenizer.pad_token_id] = -100
+        labels[attention_mask == 0] = -100
         
+        # Safety check: ensure at least one valid label exists
+        valid_labels = (labels != -100).sum()
+        if valid_labels == 0:
+            last_valid = attention_mask.sum() - 1
+            if last_valid >= 0:
+                labels[last_valid] = input_ids[last_valid]
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -127,13 +144,27 @@ def collate_fn(batch):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--model_name", type=str, default="/tmp/pretrainmodel/Qwen2.5-7B-Instruct")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--max_samples", type=int, default=100000)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_acc", type=int, default=32)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--log_file", type=str, default="training_metrics.json", help="File to save detailed training metrics")
+    parser.add_argument(
+        "--train_file",
+        type=str,
+        default=str(Path(__file__).parent.parent / "data" / "json" / "final" / "annotated_with_explanations_repaired_final.json"),
+        help="Path to annotated training samples with explanations",
+    )
+    parser.add_argument(
+        "--val_file",
+        type=str,
+        default=str(Path(__file__).parent.parent / "data" / "json" / "val_samples.json"),
+        help="Path to validation samples",
+    )
     args = parser.parse_args()
     
     rank, world_size, gpu = setup_distributed()
@@ -143,28 +174,50 @@ def main():
         print(f"Starting 7B SOTA Training on {world_size} GPUs")
         print(f"Effective Batch Size: {args.batch_size * world_size * args.grad_acc}")
 
+    # We found that even on A100, bfloat16 + nf4 + sdpa causes severe inf issues in your environment.
+    # Sticking to the proven float16 configuration from our earlier debugging session.
+    compute_dtype = torch.float16
+    if rank == 0:
+        print(f"Forcing compute dtype: {compute_dtype} (proven stable configuration)")
+
     # Quantization config for QLoRA
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16
+        bnb_4bit_compute_dtype=compute_dtype
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, padding_side="right")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         quantization_config=bnb_config,
+        torch_dtype=compute_dtype,
+
         device_map={"": gpu},
         trust_remote_code=True,
         attn_implementation="sdpa", # Use SDPA (built-in PyTorch optimization)
+        use_cache=False, # Required for gradient checkpointing
     )
     
-    model.gradient_checkpointing_enable()
-    model = prepare_model_for_kbit_training(model)
+    # Avoid PEFT internally re-enabling checkpointing with default kwargs.
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.config.use_cache = False
+
+    # Fix corrupted LM head rows from bfloat16 → float16 overflow during loading
+    # Our previous debugging showed that forcing float16 + zeroing these rows produces perfectly healthy logits.
+    with torch.no_grad():
+        lm_weight = model.lm_head.weight.data
+        inf_mask = torch.isinf(lm_weight)
+        if inf_mask.any():
+            bad_rows = torch.where(inf_mask.any(dim=1))[0]
+            if rank == 0:
+                print(f"Zeroing {len(bad_rows)} corrupted LM head rows (vocab: {bad_rows.tolist()})")
+            lm_weight[bad_rows] = 0.0
     
     lora_config = LoraConfig(
         r=64,
@@ -180,32 +233,22 @@ def main():
     if world_size > 1:
         model = DDP(model, device_ids=[gpu], find_unused_parameters=False)
     
-    # Data Loading
+    # Data Loading (Load from local processed cache)
     processor = DataProcessor()
-    train_emp = processor.load_empathetic_dialogues("train")
-    val_emp = processor.load_empathetic_dialogues("validation")
-    train_go = processor.load_goemotions("train")
-    val_go = processor.load_goemotions("validation")
     
-    # Class Balancing (Downsample Neutral)
-    def balance(samples):
-        counts = Counter([s.emotion for s in samples])
-        if "neutral" not in counts: return samples
-        # Use a more aggressive balance if needed, or just 1.5x avg
-        avg_v = sum(counts.values()) / len(counts)
-        limit = int(avg_v * 1.5)
-        if counts["neutral"] > limit:
-            neutrals = [s for s in samples if s.emotion == "neutral"]
-            others = [s for s in samples if s.emotion != "neutral"]
-            random.shuffle(neutrals)
-            return others + neutrals[:limit]
-        return samples
+    train_path = args.train_file
+    val_path = args.val_file
+        
+    if rank == 0:
+        print(f"Loading train samples from: {train_path}")
+        print(f"Loading val samples from: {val_path}")
+        
+    train_samples = processor.load_samples(str(train_path))
+    val_samples = processor.load_samples(str(val_path))
 
-    train_samples = balance(train_emp) + balance(train_go)
     random.shuffle(train_samples)
     train_samples = train_samples[:args.max_samples]
     
-    val_samples = val_emp + val_go
     if len(val_samples) > 2000: # Limit val for speed
         random.shuffle(val_samples)
         val_samples = val_samples[:2000]
@@ -216,6 +259,9 @@ def main():
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, 
         sampler=torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None,
+        shuffle=(world_size == 1),  # Shuffle when not using DistributedSampler
+        num_workers=4,
+        pin_memory=True,
         collate_fn=collate_fn
     )
     
@@ -233,6 +279,16 @@ def main():
 
     best_val_loss = float('inf')
     
+    # Initialize metrics dictionary for JSON logging
+    metrics_log = {
+        "train_loss": [],
+        "val_loss": [],
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "grad_acc": args.grad_acc,
+        "learning_rate": args.lr
+    }
+
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0
@@ -247,26 +303,36 @@ def main():
             
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = (outputs.loss * weights.mean()) / args.grad_acc
-            
-            if torch.isnan(loss):
-                if rank == 0: print("NaN loss detected! Skipping step.")
+
+            if not torch.isfinite(loss):
+                if rank == 0:
+                    print(f"Non-finite loss detected ({loss.item()}). Skipping step.")
                 optimizer.zero_grad()
                 continue
 
             loss.backward()
             
             if (step + 1) % args.grad_acc == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
             
             total_loss += loss.item() * args.grad_acc
             if rank == 0 and step % 10 == 0:
-                pbar.set_postfix(loss=loss.item() * args.grad_acc)
+                current_loss = loss.item() * args.grad_acc
+                pbar.set_postfix(loss=current_loss)
+                # Log step loss periodically
+                if step % 50 == 0:
+                    metrics_log["train_loss"].append({
+                        "epoch": epoch + 1,
+                        "step": step + 1,
+                        "loss": current_loss
+                    })
             
             # SAVE INTERMEDIATE CHECKPOINT every 1000 steps
             if (step + 1) % 1000 == 0 and rank == 0:
-                mid_path = f"{args.output_dir}/checkpoint_latest"
+                mid_path = f"{args.output_dir}/checkpoint_step_{step+1}"
                 os.makedirs(mid_path, exist_ok=True)
                 if world_size > 1:
                     model.module.save_pretrained(mid_path)
@@ -317,6 +383,18 @@ def main():
 
             if rank == 0:
                 print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
+                
+                # Log validation loss
+                metrics_log["val_loss"].append({
+                    "epoch": epoch + 1,
+                    "val_loss": avg_val_loss
+                })
+                
+                # Save metrics to file
+                log_path = os.path.join(args.output_dir, args.log_file)
+                with open(log_path, "w") as f:
+                    json.dump(metrics_log, f, indent=4)
+                
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     best_path = f"{args.output_dir}/best_model"
@@ -334,7 +412,10 @@ def main():
 
 
     if rank == 0:
-        model.module.save_pretrained(f"{args.output_dir}/final_model")
+        if world_size > 1:
+            model.module.save_pretrained(f"{args.output_dir}/final_model")
+        else:
+            model.save_pretrained(f"{args.output_dir}/final_model")
         print("Training Complete.")
 
 if __name__ == "__main__":

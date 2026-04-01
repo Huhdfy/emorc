@@ -117,7 +117,7 @@ def main():
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=64,
+                max_new_tokens=256,
                 temperature=0.1,
                 top_p=0.9,
                 do_sample=True,

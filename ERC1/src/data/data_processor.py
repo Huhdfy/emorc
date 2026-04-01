@@ -24,7 +24,12 @@ from .emotion_taxonomy import TAXONOMY, UnifiedEmotion
 
 @dataclass
 class DialogueSample:
-    """A single dialogue sample with emotion label"""
+    """
+    A single dialogue sample with emotion label
+    [Architecture Manual 3.2]: 统一样本结构。包含对话历史 (dialogue_history)、
+    目标句 (target_utterance)、统一后的 28 类情绪标签 (emotion) 及说话人信息。
+    通过该数据结构将不同的异构数据集（ED, GoEmotions, MELD）拉齐。
+    """
     sample_id: str
     dialogue_history: List[str]  # List of utterances before target
     target_utterance: str
@@ -35,9 +40,10 @@ class DialogueSample:
     prev_emotion: Optional[str] = None  # For emotion impact prediction
     dataset: str = ""
     raw_data: Dict = field(default_factory=dict)
+    explanation: Optional[str] = None  # CoT: brief explanation of why this emotion is expressed
     
     def to_dict(self) -> Dict:
-        return {
+        d = {
             "sample_id": self.sample_id,
             "dialogue_history": self.dialogue_history,
             "target_utterance": self.target_utterance,
@@ -48,10 +54,17 @@ class DialogueSample:
             "prev_emotion": self.prev_emotion,
             "dataset": self.dataset,
         }
+        if self.explanation is not None:
+            d["explanation"] = self.explanation
+        return d
 
 
 class DataProcessor:
-    """Process multiple emotion datasets into unified format"""
+    """
+    Process multiple emotion datasets into unified format.
+    [Architecture Manual 2.3 & 3]: 这里的 Processor 负责跨多个语料库提取对话字段，
+    并依赖 EmotionTaxonomy 映射为统一的分类体系 (28 类包含 neutral)，最终写入 cache json 文件。
+    """
     
     def __init__(self, cache_dir: str = "./cache"):
         self.cache_dir = Path(cache_dir)
@@ -93,6 +106,9 @@ class DataProcessor:
             turns.sort(key=lambda x: x["idx"])
             
             for i, turn in enumerate(turns):
+                # [Architecture Manual 3.3]: EmpatheticDialogues 只保留 Speaker 轮作为训练目标
+                # 因为数据集的 context (emotion label) 是针对 Speaker 的经历的，
+                # Listener 轮次的真实情绪通常不是 context 标签本身（而是共情/同情）。
                 # ONLY train/eval on the Speaker turns to match the 'context' label
                 # Listener turns are removed as their emotion doesn't match the label
                 if turn["role"] == "Listener":
@@ -166,6 +182,7 @@ class DataProcessor:
             
             sample = DialogueSample(
                 sample_id=f"ge_{i}",
+                # [Architecture Manual 3.3]: GoEmotions 是单文本分类，不具备对话上下文
                 dialogue_history=[],  # GoEmotions doesn't have dialogue context
                 target_utterance=item.get("text", ""),
                 emotion=emotion,
@@ -226,8 +243,11 @@ class DataProcessor:
                 if emotion is None:
                     emotion = "neutral"
                 
+                # [Architecture Manual 3.3]: MELD 按发生顺序构建完整的历史上下文
                 history = [t["utterance"] for t in turns[:i]]
                 prev_emotion = None
+                
+                # 提取前一轮的情绪和说话人信息，用于辅助建模交互或影响
                 if i > 0:
                     prev_emotion = self.taxonomy.map_emotion(
                         turns[i-1]["emotion"], "meld"
@@ -300,6 +320,7 @@ class DataProcessor:
                 prev_speaker=item.get("prev_speaker"),
                 prev_emotion=item.get("prev_emotion"),
                 dataset=item.get("dataset", ""),
+                explanation=item.get("explanation"),
             )
             samples.append(sample)
         

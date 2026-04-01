@@ -63,6 +63,7 @@ def evaluate(model, tokenizer, samples, max_length=512, batch_size=4):
         prompt = builder.build_inference_prompt(
             dialogue_history=sample.dialogue_history,
             target_utterance=sample.target_utterance,
+            prev_impact=f"Previous emotion was {sample.prev_emotion}." if sample.prev_emotion else None,
         )
         
         # Tokenize
@@ -78,7 +79,7 @@ def evaluate(model, tokenizer, samples, max_length=512, batch_size=4):
             outputs = model.generate(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
-                max_new_tokens=64,
+                max_new_tokens=256,
                 temperature=0.1,
                 top_p=0.9,
                 do_sample=True,

@@ -2,6 +2,7 @@
 Prompt Templates for Multi-Task Fine-Grained Emotion Recognition
 """
 
+import re
 from typing import List, Optional
 from dataclasses import dataclass
 
@@ -11,6 +12,8 @@ from ..data.emotion_taxonomy import TAXONOMY
 @dataclass
 class PromptTemplate:
     """Multi-task prompt template for emotion recognition"""
+
+    EXPLANATION_PREFIX: str = "- Explanation: "
     
     system_instruction: str = "You are an expert emotion recognition assistant. Analyze the dialogue and identify the emotion of the target utterance from the standard 28-class taxonomy."
 
@@ -76,6 +79,7 @@ Dialogue History:
 Target Utterance: {target_utterance}
 
 Provide your analysis in the following format:
+- Explanation: [brief explanation of why this emotion is expressed, citing specific text cues]
 - Emotion: [your emotion prediction]
 - Speaker: [speaker identification]
 - Impact: [how previous context influenced the emotion]"""
@@ -87,6 +91,7 @@ Provide your analysis in the following format:
         demonstrations: Optional[List[dict]] = None,
         include_system: bool = True,
         prev_impact: Optional[str] = None,
+        assistant_prefix: str = "",
     ) -> str:
         """Build complete prompt with optional demonstrations"""
         parts = []
@@ -116,7 +121,7 @@ Provide your analysis in the following format:
         parts.append(f"<|im_start|>user\n{query}<|im_end|>")
         
         # Assistant response start
-        parts.append("<|im_start|>assistant\n")
+        parts.append(f"<|im_start|>assistant\n{assistant_prefix}")
         
         return "\n".join(parts)
     
@@ -128,17 +133,23 @@ Provide your analysis in the following format:
         speaker: str,
         prev_impact: Optional[str] = None,
         demonstrations: Optional[List[dict]] = None,
+        explanation: Optional[str] = None,
     ) -> str:
         """Build prompt for training with target response"""
+        has_explanation = bool(explanation and explanation.strip())
         prompt = self.build_full_prompt(
             dialogue_history=dialogue_history,
             target_utterance=target_utterance,
             demonstrations=demonstrations,
             prev_impact=prev_impact,
+            assistant_prefix=self.EXPLANATION_PREFIX if has_explanation else "",
         )
         
-        # Build target response - ALWAYS include Impact field for consistency
-        response = f"- Emotion: {emotion}\n- Speaker: {speaker}"
+        # Build target response - CoT format (Explanation first)
+        response = ""
+        if has_explanation:
+            response += f"{explanation.strip()}\n"
+        response += f"- Emotion: {emotion}\n- Speaker: {speaker}"
         if prev_impact:
             response += f"\n- Impact: {prev_impact}"
         else:
@@ -163,6 +174,7 @@ class EmotionPromptBuilder:
         target_utterance: str,
         retrieved_examples: Optional[List[dict]] = None,
         prev_impact: Optional[str] = None,
+        force_explanation: bool = True,
     ) -> str:
         """Build prompt for inference"""
         demonstrations = None
@@ -174,6 +186,7 @@ class EmotionPromptBuilder:
             target_utterance=target_utterance,
             demonstrations=demonstrations,
             prev_impact=prev_impact,
+            assistant_prefix=self.template.EXPLANATION_PREFIX if force_explanation else "",
         )
     
     def build_training_prompt(
@@ -184,6 +197,7 @@ class EmotionPromptBuilder:
         speaker: str,
         prev_impact: Optional[str] = None,
         retrieved_examples: Optional[List[dict]] = None,
+        explanation: Optional[str] = None,
     ) -> str:
         """Build prompt for training"""
         demonstrations = None
@@ -197,6 +211,7 @@ class EmotionPromptBuilder:
             speaker=speaker,
             prev_impact=prev_impact,
             demonstrations=demonstrations,
+            explanation=explanation,
         )
 
 
@@ -204,23 +219,49 @@ def parse_model_output(output: str) -> dict:
     """Parse model output to extract predictions"""
     result = {
         "emotion": "neutral",
+        "explanation": None,
         "speaker": "Unknown",
         "impact": None,
     }
-    
-    lines = output.strip().split("\n")
-    for line in lines:
-        line = line.strip()
-        # Handle both "- Emotion:" and "Emotion:"
-        if line.startswith("- Emotion:") or line.startswith("Emotion:"):
-            emotion_raw = line.split(":", 1)[1].strip()
-            # Clean up: take only the first word or handle parentheses
-            # Example: "fear (threat response)" -> "fear"
-            emotion_clean = emotion_raw.split("(")[0].strip().lower()
-            result["emotion"] = emotion_clean
-        elif line.startswith("- Speaker:") or line.startswith("Speaker:"):
-            result["speaker"] = line.split(":", 1)[1].strip()
-        elif line.startswith("- Impact:") or line.startswith("Impact:"):
-            result["impact"] = line.split(":", 1)[1].strip()
-    
+
+    cleaned = output.strip()
+    if not cleaned:
+        return result
+
+    cleaned = cleaned.replace("<|im_end|>", "").replace("<|endoftext|>", "").strip()
+
+    def extract_last_field(field_name: str):
+        pattern = rf"(?:^|\n)\s*-?\s*{re.escape(field_name)}:\s*(.+)"
+        matches = list(re.finditer(pattern, cleaned, flags=re.IGNORECASE))
+        if not matches:
+            return None, None
+        match = matches[-1]
+        value = match.group(1).strip()
+        return value, match
+
+    emotion_raw, emotion_match = extract_last_field("Emotion")
+    if emotion_raw:
+        emotion_clean = emotion_raw.split("(")[0].strip().lower()
+        result["emotion"] = emotion_clean
+
+    speaker_raw, _ = extract_last_field("Speaker")
+    if speaker_raw:
+        result["speaker"] = speaker_raw
+
+    impact_raw, _ = extract_last_field("Impact")
+    if impact_raw:
+        result["impact"] = impact_raw
+
+    explanation_raw, explanation_match = extract_last_field("Explanation")
+    if explanation_raw:
+        if emotion_match and explanation_match and explanation_match.start() < emotion_match.start():
+            explanation_span = cleaned[explanation_match.end():emotion_match.start()]
+            explanation_raw = explanation_span.strip() or explanation_raw
+        result["explanation"] = explanation_raw.strip()
+    elif emotion_match:
+        prefix_text = cleaned[:emotion_match.start()].strip()
+        if prefix_text:
+            prefix_text = re.sub(r"^\s*-?\s*Explanation:\s*", "", prefix_text, flags=re.IGNORECASE)
+            result["explanation"] = prefix_text.strip() or None
+
     return result
