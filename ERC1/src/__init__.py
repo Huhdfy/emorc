@@ -1,7 +1,3 @@
-# src/__init__.py
-from . import data
-from . import models
-from . import retrieval
-from . import evaluation
+"""Minimal src package for CoT training."""
 
 __version__ = "0.1.0"
