@@ -75,21 +75,14 @@ class MultiDatasetEmotionDataset(Dataset):
     
     def __len__(self):
         return len(self.samples)
-
-    def _build_prev_impact(self, sample):
-        if sample.prev_emotion:
-            return f"Previous emotion was {sample.prev_emotion}."
-        return None
     
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        prev_impact = self._build_prev_impact(sample)
         prompt = self.builder.build_training_prompt(
             dialogue_history=sample.dialogue_history,
             target_utterance=sample.target_utterance,
             emotion=sample.emotion,
             speaker=sample.speaker,
-            prev_impact=prev_impact,
             explanation=sample.explanation,
         )
         
@@ -109,7 +102,6 @@ class MultiDatasetEmotionDataset(Dataset):
         prompt_without_res = self.builder.build_inference_prompt(
             dialogue_history=sample.dialogue_history,
             target_utterance=sample.target_utterance,
-            prev_impact=prev_impact,
             force_explanation=bool(sample.explanation),
         )
         # We need to be careful with tokens. Finding string match is safer.
@@ -156,14 +148,14 @@ def main():
     parser.add_argument(
         "--train_file",
         type=str,
-        default=str(Path(__file__).parent.parent / "data" / "json" / "final" / "annotated_with_explanations_repaired_final.json"),
-        help="Path to annotated training samples with explanations",
+        default=str(Path(__file__).parent.parent / "data" / "json" / "final" / "annotated_with_explanations_repaired_final_debiased.json"),
+        help="Path to debiased annotated training samples with explanations",
     )
     parser.add_argument(
         "--val_file",
         type=str,
-        default=str(Path(__file__).parent.parent / "data" / "json" / "val_samples.json"),
-        help="Path to validation samples",
+        default=str(Path(__file__).parent.parent / "data" / "json" / "val_samples_debiased.json"),
+        help="Path to debiased validation samples",
     )
     args = parser.parse_args()
     

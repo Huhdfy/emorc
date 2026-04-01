@@ -63,7 +63,6 @@ def evaluate(model, tokenizer, samples, max_length=512, batch_size=4):
         prompt = builder.build_inference_prompt(
             dialogue_history=sample.dialogue_history,
             target_utterance=sample.target_utterance,
-            prev_impact=f"Previous emotion was {sample.prev_emotion}." if sample.prev_emotion else None,
         )
         
         # Tokenize
@@ -150,7 +149,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--test_data", type=str, default="cache/data/test_samples.json")
+    parser.add_argument("--test_data", type=str, default="ERC1/data/json/val_samples_debiased.json")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
