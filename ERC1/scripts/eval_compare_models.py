@@ -4,7 +4,8 @@ Compare a label-only baseline model and a CoT model on the same dataset.
 
 Example:
     python ERC1/scripts/eval_compare_models.py \
-      --baseline_model fQwQf/erc-qwen2.5-7b-sota \
+      --baseline_base_model /tmp/pretrainmodel/Qwen2.5-7B-Instruct \
+      --baseline_lora_path fQwQf/erc-qwen2.5-7b-sota \
       --cot_base_model /tmp/pretrainmodel/Qwen2.5-7B-Instruct \
       --cot_lora_path ./outputs/qwen7b_cot/final_model \
       --test_data ERC1/data/json/val_samples.json \
@@ -26,7 +27,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
-from sklearn.metrics import f1_score, accuracy_score
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
 
 from src.data.data_processor import DataProcessor
 from src.data.emotion_taxonomy import TAXONOMY
@@ -189,8 +190,8 @@ def evaluate_baseline(model, tokenizer, samples, max_length: int):
     return predictions, details
 
 
-def evaluate_cot(model, tokenizer, samples, max_length: int):
-    builder = EmotionPromptBuilder(use_retrieval=False)
+def evaluate_cot(model, tokenizer, samples, max_length: int, explanation_position: str):
+    builder = EmotionPromptBuilder(use_retrieval=False, explanation_position=explanation_position)
     predictions = []
     details = []
 
@@ -232,6 +233,34 @@ def compute_metrics(predictions, ground_truths):
     }
 
 
+def build_confusion_data(predictions, ground_truths, labels):
+    """Build serializable confusion matrix payload."""
+    cm = confusion_matrix(ground_truths, predictions, labels=labels)
+    return {
+        "labels": labels,
+        "matrix": cm.tolist(),  # rows: gold, cols: pred
+    }
+
+
+def top_confusions(confusion_data, top_k=10):
+    """Return top off-diagonal confusions."""
+    labels = confusion_data["labels"]
+    matrix = confusion_data["matrix"]
+    pairs = []
+    for i, gold in enumerate(labels):
+        for j, pred in enumerate(labels):
+            if i == j:
+                continue
+            count = matrix[i][j]
+            if count > 0:
+                pairs.append((count, gold, pred))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+    return [
+        {"count": c, "gold": g, "pred": p}
+        for c, g, p in pairs[:top_k]
+    ]
+
+
 def print_disagreement_examples(samples, baseline_details, cot_details, limit: int):
     baseline_map = {item["sample_id"]: item for item in baseline_details}
     cot_map = {item["sample_id"]: item for item in cot_details}
@@ -263,7 +292,8 @@ def print_disagreement_examples(samples, baseline_details, cot_details, limit: i
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--baseline_model", type=str, required=True, help="HF model id or local path for label-only baseline")
+    parser.add_argument("--baseline_base_model", type=str, required=True, help="Base model for label-only baseline")
+    parser.add_argument("--baseline_lora_path", type=str, default=None, help="Optional LoRA path for label-only baseline")
     parser.add_argument("--cot_base_model", type=str, required=True, help="Base model for CoT evaluation")
     parser.add_argument("--cot_lora_path", type=str, required=True, help="LoRA path for CoT model")
     parser.add_argument("--test_data", type=str, default="ERC1/data/json/val_samples_debiased.json")
@@ -271,6 +301,7 @@ def main():
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--show_examples", type=int, default=8)
+    parser.add_argument("--cot_explanation_position", type=str, choices=["before", "after"], default="before")
     args = parser.parse_args()
 
     processor = DataProcessor()
@@ -279,7 +310,7 @@ def main():
         samples = samples[:args.max_samples]
     print(f"Loaded {len(samples)} evaluation samples from {args.test_data}")
 
-    baseline_model, baseline_tokenizer = load_model(args.baseline_model)
+    baseline_model, baseline_tokenizer = load_model(args.baseline_base_model, args.baseline_lora_path)
     baseline_predictions, baseline_details = evaluate_baseline(
         baseline_model, baseline_tokenizer, samples, max_length=args.max_length
     )
@@ -289,7 +320,11 @@ def main():
 
     cot_model, cot_tokenizer = load_model(args.cot_base_model, args.cot_lora_path)
     cot_predictions, cot_details = evaluate_cot(
-        cot_model, cot_tokenizer, samples, max_length=args.max_length
+        cot_model,
+        cot_tokenizer,
+        samples,
+        max_length=args.max_length,
+        explanation_position=args.cot_explanation_position,
     )
     del cot_model
     if torch.cuda.is_available():
@@ -298,13 +333,20 @@ def main():
     ground_truths = [sample.emotion.lower() for sample in samples]
     baseline_metrics = compute_metrics(baseline_predictions, ground_truths)
     cot_metrics = compute_metrics(cot_predictions, ground_truths)
+    matrix_labels = list(TAXONOMY.emotions)
+    baseline_confusion = build_confusion_data(baseline_predictions, ground_truths, matrix_labels)
+    cot_confusion = build_confusion_data(cot_predictions, ground_truths, matrix_labels)
+    baseline_top_confusions = top_confusions(baseline_confusion, top_k=10)
+    cot_top_confusions = top_confusions(cot_confusion, top_k=10)
 
     summary = {
         "num_samples": len(samples),
         "dataset": args.test_data,
-        "baseline_model": args.baseline_model,
+        "baseline_base_model": args.baseline_base_model,
+        "baseline_lora_path": args.baseline_lora_path,
         "cot_base_model": args.cot_base_model,
         "cot_lora_path": args.cot_lora_path,
+        "cot_explanation_position": args.cot_explanation_position,
         "baseline_metrics": baseline_metrics,
         "cot_metrics": cot_metrics,
         "delta": {
@@ -312,6 +354,8 @@ def main():
             "macro_f1": cot_metrics["macro_f1"] - baseline_metrics["macro_f1"],
             "accuracy": cot_metrics["accuracy"] - baseline_metrics["accuracy"],
         },
+        "baseline_top_confusions": baseline_top_confusions,
+        "cot_top_confusions": cot_top_confusions,
     }
 
     print("\n" + "=" * 60)
@@ -329,6 +373,13 @@ def main():
     print(f"Delta macro_f1      : {summary['delta']['macro_f1']:+.4f}")
     print(f"Delta accuracy      : {summary['delta']['accuracy']:+.4f}")
 
+    print("\nTop baseline confusions (gold -> pred):")
+    for item in baseline_top_confusions[:5]:
+        print(f"  {item['gold']} -> {item['pred']}: {item['count']}")
+    print("Top CoT confusions (gold -> pred):")
+    for item in cot_top_confusions[:5]:
+        print(f"  {item['gold']} -> {item['pred']}: {item['count']}")
+
     print_disagreement_examples(samples, baseline_details, cot_details, args.show_examples)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -338,10 +389,16 @@ def main():
         json.dump(baseline_details, f, ensure_ascii=False, indent=2)
     with open(os.path.join(args.output_dir, "cot_details.json"), "w", encoding="utf-8") as f:
         json.dump(cot_details, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(args.output_dir, "baseline_confusion_matrix.json"), "w", encoding="utf-8") as f:
+        json.dump(baseline_confusion, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(args.output_dir, "cot_confusion_matrix.json"), "w", encoding="utf-8") as f:
+        json.dump(cot_confusion, f, ensure_ascii=False, indent=2)
 
     print(f"\nSaved summary to {os.path.join(args.output_dir, 'comparison_summary.json')}")
     print(f"Saved baseline details to {os.path.join(args.output_dir, 'baseline_details.json')}")
     print(f"Saved CoT details to {os.path.join(args.output_dir, 'cot_details.json')}")
+    print(f"Saved baseline confusion matrix to {os.path.join(args.output_dir, 'baseline_confusion_matrix.json')}")
+    print(f"Saved CoT confusion matrix to {os.path.join(args.output_dir, 'cot_confusion_matrix.json')}")
 
 
 if __name__ == "__main__":

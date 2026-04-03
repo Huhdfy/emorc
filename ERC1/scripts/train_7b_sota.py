@@ -57,14 +57,15 @@ def setup_distributed():
     return rank, world_size, gpu
 
 class MultiDatasetEmotionDataset(Dataset):
-    def __init__(self, samples, tokenizer, max_length=768):
+    def __init__(self, samples, tokenizer, max_length=768, explanation_position="before"):
         self.samples = samples
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.builder = EmotionPromptBuilder(use_retrieval=False)
+        self.builder = EmotionPromptBuilder(use_retrieval=False, explanation_position=explanation_position)
         self.class_weights = self._calculate_class_weights()
     
     def _calculate_class_weights(self):
+        '''根据样本中的情绪类别进行加权，样本越少，权重越高'''
         emotion_counts = Counter([s.emotion for s in self.samples])
         total = len(self.samples)
         weights = {}
@@ -144,6 +145,13 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_acc", type=int, default=32)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument(
+        "--explanation_position",
+        type=str,
+        choices=["before", "after"],
+        default="before",
+        help="Whether to place the explanation before or after the emotion field.",
+    )
     parser.add_argument("--log_file", type=str, default="training_metrics.json", help="File to save detailed training metrics")
     parser.add_argument(
         "--train_file",
@@ -165,6 +173,7 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         print(f"Starting 7B SOTA Training on {world_size} GPUs")
         print(f"Effective Batch Size: {args.batch_size * world_size * args.grad_acc}")
+        print(f"Explanation position: {args.explanation_position}")
 
     # We found that even on A100, bfloat16 + nf4 + sdpa causes severe inf issues in your environment.
     # Sticking to the proven float16 configuration from our earlier debugging session.
@@ -245,8 +254,8 @@ def main():
         random.shuffle(val_samples)
         val_samples = val_samples[:2000]
     
-    train_ds = MultiDatasetEmotionDataset(train_samples, tokenizer)
-    val_ds = MultiDatasetEmotionDataset(val_samples, tokenizer)
+    train_ds = MultiDatasetEmotionDataset(train_samples, tokenizer, explanation_position=args.explanation_position)
+    val_ds = MultiDatasetEmotionDataset(val_samples, tokenizer, explanation_position=args.explanation_position)
     
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, 
@@ -278,7 +287,8 @@ def main():
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "grad_acc": args.grad_acc,
-        "learning_rate": args.lr
+        "learning_rate": args.lr,
+        "explanation_position": args.explanation_position,
     }
 
     for epoch in range(args.epochs):

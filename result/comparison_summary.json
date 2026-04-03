@@ -1,0 +1,127 @@
+{
+  "num_samples": 750,
+  "dataset": "ERC1/data/json/val_samples_debiased.json",
+  "baseline_base_model": "/tmp/pretrainmodel/Qwen2.5-7B-Instruct",
+  "baseline_lora_path": "fQwQf/erc-qwen2.5-7b-sota",
+  "cot_base_model": "/tmp/pretrainmodel/Qwen2.5-7B-Instruct",
+  "cot_lora_path": "./outputs/qwen7b_cot_debiased/checkpoint_2",
+  "baseline_metrics": {
+    "weighted_f1": 0.31970956747843987,
+    "macro_f1": 0.2689499170518219,
+    "accuracy": 0.30133333333333334
+  },
+  "cot_metrics": {
+    "weighted_f1": 0.2069698863037749,
+    "macro_f1": 0.1619927725758565,
+    "accuracy": 0.176
+  },
+  "delta": {
+    "weighted_f1": -0.11273968117466496,
+    "macro_f1": -0.10695714447596541,
+    "accuracy": -0.12533333333333335
+  },
+  "baseline_top_confusions": [
+    {
+      "count": 30,
+      "gold": "sadness",
+      "pred": "neutral"
+    },
+    {
+      "count": 28,
+      "gold": "shame",
+      "pred": "disappointment"
+    },
+    {
+      "count": 20,
+      "gold": "grief",
+      "pred": "sadness"
+    },
+    {
+      "count": 16,
+      "gold": "caring",
+      "pred": "love"
+    },
+    {
+      "count": 11,
+      "gold": "optimism",
+      "pred": "excitement"
+    },
+    {
+      "count": 11,
+      "gold": "optimism",
+      "pred": "pride"
+    },
+    {
+      "count": 11,
+      "gold": "optimism",
+      "pred": "hope"
+    },
+    {
+      "count": 9,
+      "gold": "hope",
+      "pred": "love"
+    },
+    {
+      "count": 9,
+      "gold": "jealousy",
+      "pred": "disappointment"
+    },
+    {
+      "count": 8,
+      "gold": "excitement",
+      "pred": "hope"
+    }
+  ],
+  "cot_top_confusions": [
+    {
+      "count": 16,
+      "gold": "shame",
+      "pred": "caring"
+    },
+    {
+      "count": 14,
+      "gold": "caring",
+      "pred": "gratitude"
+    },
+    {
+      "count": 10,
+      "gold": "optimism",
+      "pred": "hope"
+    },
+    {
+      "count": 9,
+      "gold": "caring",
+      "pred": "joy"
+    },
+    {
+      "count": 8,
+      "gold": "excitement",
+      "pred": "joy"
+    },
+    {
+      "count": 8,
+      "gold": "hope",
+      "pred": "love"
+    },
+    {
+      "count": 8,
+      "gold": "optimism",
+      "pred": "gratitude"
+    },
+    {
+      "count": 8,
+      "gold": "sadness",
+      "pred": "caring"
+    },
+    {
+      "count": 8,
+      "gold": "shame",
+      "pred": "relief"
+    },
+    {
+      "count": 7,
+      "gold": "sadness",
+      "pred": "hope"
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 """
-Prompt Templates for Multi-Task Fine-Grained Emotion Recognition
+Prompt templates for explanation-guided fine-grained emotion recognition.
 """
 
 import re
@@ -11,13 +11,20 @@ from ..data.emotion_taxonomy import TAXONOMY
 
 @dataclass
 class PromptTemplate:
-    """Multi-task prompt template for emotion recognition"""
+    """Prompt template for explanation + emotion generation."""
 
     EXPLANATION_PREFIX: str = "- Explanation: "
+    EMOTION_PREFIX: str = "- Emotion: "
     
     system_instruction: str = "You are an expert emotion recognition assistant. Analyze the dialogue and identify the emotion of the target utterance from the standard 28-class taxonomy."
 
     emotion_list: str = "Standard emotions: joy, excitement, happiness, gratitude, pride, relief, hope, love, caring, desire, optimism, amusement, sadness, anger, fear, anxiety, disgust, shame, guilt, disappointment, frustration, grief, loneliness, jealousy, neutral, surprise, confusion, curiosity, nervousness."
+
+    @staticmethod
+    def validate_explanation_position(explanation_position: str) -> str:
+        if explanation_position not in {"before", "after"}:
+            raise ValueError(f"Unsupported explanation_position: {explanation_position}")
+        return explanation_position
 
     @staticmethod
     def format_dialogue_history(history: List[str], max_turns: int = 5) -> str:
@@ -36,12 +43,19 @@ class PromptTemplate:
         dialogue_history: List[str],
         target_utterance: str,
         emotion: str,
-        speaker: str = "Speaker",
-        prev_impact: Optional[str] = None,
+        explanation: Optional[str] = None,
+        explanation_position: str = "before",
     ) -> str:
         """Format a single demonstration example"""
+        explanation_position = PromptTemplate.validate_explanation_position(explanation_position)
         history_str = PromptTemplate.format_dialogue_history(dialogue_history)
-        
+        explanation_text = (explanation or "The emotion is inferred from the target utterance and dialogue context.").strip()
+
+        if explanation_position == "before":
+            analysis = f"- Explanation: {explanation_text}\n- Emotion: {emotion}"
+        else:
+            analysis = f"- Emotion: {emotion}\n- Explanation: {explanation_text}"
+
         demo = f"""Example:
 Dialogue History:
 {history_str}
@@ -49,11 +63,7 @@ Dialogue History:
 Target Utterance: {target_utterance}
 
 Analysis:
-- Emotion: {emotion}
-- Speaker: {speaker}"""
-        
-        if prev_impact:
-            demo += f"\n- Impact of previous utterance: {prev_impact}"
+{analysis}"""
         
         return demo
     
@@ -62,15 +72,23 @@ Analysis:
         dialogue_history: List[str],
         target_utterance: str,
         prev_impact: Optional[str] = None,
+        explanation_position: str = "before",
     ) -> str:
         """Format the query (input to be predicted)"""
+        explanation_position = PromptTemplate.validate_explanation_position(explanation_position)
         history_str = PromptTemplate.format_dialogue_history(dialogue_history)
-        
-        # If prev_impact is provided, add it to the dialogue history as context
-        # This helps the model understand the emotional context of the conversation
-        if prev_impact:
-            history_str += f"\n\n[Context: {prev_impact}]"
-        
+
+        if explanation_position == "before":
+            output_format = (
+                "- Explanation: [brief explanation of why this emotion is expressed, citing specific text cues]\n"
+                "- Emotion: [your emotion prediction]"
+            )
+        else:
+            output_format = (
+                "- Emotion: [your emotion prediction]\n"
+                "- Explanation: [brief explanation of why this emotion is expressed, citing specific text cues]"
+            )
+
         return f"""Now analyze this dialogue:
 
 Dialogue History:
@@ -79,10 +97,7 @@ Dialogue History:
 Target Utterance: {target_utterance}
 
 Provide your analysis in the following format:
-- Explanation: [brief explanation of why this emotion is expressed, citing specific text cues]
-- Emotion: [your emotion prediction]
-- Speaker: [speaker identification]
-- Impact: [how previous context influenced the emotion]"""
+{output_format}"""
     
     def build_full_prompt(
         self,
@@ -92,8 +107,10 @@ Provide your analysis in the following format:
         include_system: bool = True,
         prev_impact: Optional[str] = None,
         assistant_prefix: str = "",
+        explanation_position: str = "before",
     ) -> str:
         """Build complete prompt with optional demonstrations"""
+        explanation_position = self.validate_explanation_position(explanation_position)
         parts = []
         
         # System instruction
@@ -108,8 +125,8 @@ Provide your analysis in the following format:
                     dialogue_history=demo.get("dialogue_history", []),
                     target_utterance=demo.get("target_utterance", ""),
                     emotion=demo.get("emotion", "neutral"),
-                    speaker=demo.get("speaker", "Speaker"),
-                    prev_impact=demo.get("impact"),
+                    explanation=demo.get("explanation"),
+                    explanation_position=explanation_position,
                 )
                 demo_parts.append(demo_str)
             
@@ -117,7 +134,12 @@ Provide your analysis in the following format:
                 parts.append(f"<|im_start|>user\nHere are some examples:\n\n" + "\n\n".join(demo_parts) + "<|im_end|>")
         
         # Query
-        query = self.format_query(dialogue_history, target_utterance, prev_impact)
+        query = self.format_query(
+            dialogue_history,
+            target_utterance,
+            prev_impact=prev_impact,
+            explanation_position=explanation_position,
+        )
         parts.append(f"<|im_start|>user\n{query}<|im_end|>")
         
         # Assistant response start
@@ -134,27 +156,30 @@ Provide your analysis in the following format:
         prev_impact: Optional[str] = None,
         demonstrations: Optional[List[dict]] = None,
         explanation: Optional[str] = None,
+        explanation_position: str = "before",
     ) -> str:
         """Build prompt for training with target response"""
+        explanation_position = self.validate_explanation_position(explanation_position)
         has_explanation = bool(explanation and explanation.strip())
+        assistant_prefix = self.EXPLANATION_PREFIX if explanation_position == "before" else self.EMOTION_PREFIX
         prompt = self.build_full_prompt(
             dialogue_history=dialogue_history,
             target_utterance=target_utterance,
             demonstrations=demonstrations,
             prev_impact=prev_impact,
-            assistant_prefix=self.EXPLANATION_PREFIX if has_explanation else "",
+            assistant_prefix=assistant_prefix if has_explanation else "",
+            explanation_position=explanation_position,
         )
         
-        # Build target response - CoT format (Explanation first)
-        response = ""
-        if has_explanation:
-            response += f"{explanation.strip()}\n"
-        response += f"- Emotion: {emotion}\n- Speaker: {speaker}"
-        if prev_impact:
-            response += f"\n- Impact: {prev_impact}"
+        if explanation_position == "before":
+            response = ""
+            if has_explanation:
+                response += f"{explanation.strip()}\n"
+            response += f"- Emotion: {emotion}"
         else:
-            # For first utterance or standalone, provide a default standalone impact
-            response += "\n- Impact: This is a standalone statement without prior emotional context."
+            response = f"{emotion}"
+            if has_explanation:
+                response += f"\n- Explanation: {explanation.strip()}"
         response += "<|im_end|>"
         
         return prompt + response
@@ -163,10 +188,11 @@ Provide your analysis in the following format:
 class EmotionPromptBuilder:
     """Builder class for creating prompts with retrieval augmentation"""
     
-    def __init__(self, use_retrieval: bool = True, top_k: int = 3):
+    def __init__(self, use_retrieval: bool = True, top_k: int = 3, explanation_position: str = "before"):
         self.template = PromptTemplate()
         self.use_retrieval = use_retrieval
         self.top_k = top_k
+        self.explanation_position = self.template.validate_explanation_position(explanation_position)
     
     def build_inference_prompt(
         self,
@@ -186,7 +212,12 @@ class EmotionPromptBuilder:
             target_utterance=target_utterance,
             demonstrations=demonstrations,
             prev_impact=prev_impact,
-            assistant_prefix=self.template.EXPLANATION_PREFIX if force_explanation else "",
+            assistant_prefix=(
+                self.template.EXPLANATION_PREFIX
+                if self.explanation_position == "before"
+                else self.template.EMOTION_PREFIX
+            ) if force_explanation else "",
+            explanation_position=self.explanation_position,
         )
     
     def build_training_prompt(
@@ -212,6 +243,7 @@ class EmotionPromptBuilder:
             prev_impact=prev_impact,
             demonstrations=demonstrations,
             explanation=explanation,
+            explanation_position=self.explanation_position,
         )
 
 
@@ -220,8 +252,6 @@ def parse_model_output(output: str) -> dict:
     result = {
         "emotion": "neutral",
         "explanation": None,
-        "speaker": "Unknown",
-        "impact": None,
     }
 
     cleaned = output.strip()
@@ -243,14 +273,17 @@ def parse_model_output(output: str) -> dict:
     if emotion_raw:
         emotion_clean = emotion_raw.split("(")[0].strip().lower()
         result["emotion"] = emotion_clean
-
-    speaker_raw, _ = extract_last_field("Speaker")
-    if speaker_raw:
-        result["speaker"] = speaker_raw
-
-    impact_raw, _ = extract_last_field("Impact")
-    if impact_raw:
-        result["impact"] = impact_raw
+    else:
+        # In explanation-after mode, the assistant may continue from the
+        # "- Emotion: " prefix already present in the prompt, so the generated
+        # text can start with a bare label like "joy" on the first line.
+        first_line = cleaned.splitlines()[0].strip()
+        if first_line:
+            first_line = first_line.strip(" -:\t")
+            candidate = first_line.split("(")[0].strip().lower()
+            if candidate in TAXONOMY.emotions:
+                result["emotion"] = candidate
+                emotion_match = re.search(re.escape(cleaned.splitlines()[0]), cleaned)
 
     explanation_raw, explanation_match = extract_last_field("Explanation")
     if explanation_raw:

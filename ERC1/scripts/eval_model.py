@@ -8,7 +8,6 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from collections import Counter
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -23,6 +22,26 @@ from sklearn.metrics import f1_score, accuracy_score, classification_report
 from src.data.data_processor import DataProcessor
 from src.data.emotion_taxonomy import TAXONOMY
 from src.models.prompt_template import EmotionPromptBuilder, parse_model_output
+
+
+def sanitize_lm_head(model):
+    """Zero corrupted lm_head rows that can produce inf/nan logits."""
+    target_model = model
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        target_model = model.base_model.model
+    elif hasattr(model, "model"):
+        target_model = model.model
+
+    if not hasattr(target_model, "lm_head"):
+        return
+
+    with torch.no_grad():
+        lm_weight = target_model.lm_head.weight.data
+        inf_mask = torch.isinf(lm_weight) | torch.isnan(lm_weight)
+        if inf_mask.any():
+            bad_rows = torch.where(inf_mask.any(dim=1))[0]
+            print(f"Zeroing {len(bad_rows)} corrupted LM head rows (vocab: {bad_rows.tolist()})")
+            lm_weight[bad_rows] = 0.0
 
 
 def load_model(base_model_path, lora_path=None):
@@ -40,21 +59,23 @@ def load_model(base_model_path, lora_path=None):
     model = AutoModelForCausalLM.from_pretrained(
         base_model_path,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,
         device_map="auto",
     )
+    sanitize_lm_head(model)
     
     if lora_path:
         print(f"Loading LoRA weights from: {lora_path}")
         model = PeftModel.from_pretrained(model, lora_path)
+        sanitize_lm_head(model)
     
     model.eval()
     return model, tokenizer
 
 
-def evaluate(model, tokenizer, samples, max_length=512, batch_size=4):
+def evaluate(model, tokenizer, samples, max_length=512, explanation_position="before"):
     """Evaluate model on samples"""
-    builder = EmotionPromptBuilder(use_retrieval=False)
+    builder = EmotionPromptBuilder(use_retrieval=False, explanation_position=explanation_position)
     predictions = []
     ground_truths = []
     
@@ -79,9 +100,7 @@ def evaluate(model, tokenizer, samples, max_length=512, batch_size=4):
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 max_new_tokens=256,
-                temperature=0.1,
-                top_p=0.9,
-                do_sample=True,
+                do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
@@ -152,6 +171,7 @@ def main():
     parser.add_argument("--test_data", type=str, default="ERC1/data/json/val_samples_debiased.json")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--explanation_position", type=str, choices=["before", "after"], default="before")
     args = parser.parse_args()
     
     # Load model
@@ -168,7 +188,12 @@ def main():
     print(f"Test samples: {len(samples)}")
     
     # Evaluate
-    predictions, ground_truths = evaluate(model, tokenizer, samples)
+    predictions, ground_truths = evaluate(
+        model,
+        tokenizer,
+        samples,
+        explanation_position=args.explanation_position,
+    )
     
     # Compute metrics
     metrics = compute_metrics(predictions, ground_truths)
